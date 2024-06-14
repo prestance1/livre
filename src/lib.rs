@@ -10,17 +10,15 @@ pub enum LivreError {
     UnfillableOrder,
     OrderNotFound,
     DuplicateOrderId,
-    QuantityTooBig,
 }
 
 impl Display for LivreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            LivreError::UnfillableOrder => write!(f, "Could not fill order"),
-            LivreError::DuplicateOrderId => write!(f, "Order id already in use"),
-            LivreError::QuantityTooBig => write!(f, "Fill quantity exceeds order lot size"),
-            LivreError::OrderNotFound => write!(f, "Could not find order matching id"),
-        }
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            LivreError::UnfillableOrder => "could not fill order",
+            LivreError::DuplicateOrderId => "order id already in use",
+            LivreError::OrderNotFound => "could not find order matching id",
+        })
     }
 }
 
@@ -35,7 +33,7 @@ pub enum OrderType {
     Market,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Bid,
     Ask,
@@ -50,12 +48,12 @@ pub enum OrderState {
 
 #[derive(Debug)]
 pub struct Order {
-    pub order_id: u64,
-    pub order_type: OrderType,
-    pub side: Side,
-    pub price: u64,
-    pub initial_quantity: u64,
-    pub remaining_quantity: u64,
+    order_id: u64,
+    order_type: OrderType,
+    side: Side,
+    price: u64,
+    initial_quantity: u64,
+    remaining_quantity: u64,
 }
 
 impl Order {
@@ -90,26 +88,25 @@ impl Order {
         }
     }
 
-    pub fn fill(&mut self, quantity: u64) -> Result<(), LivreError> {
+    pub fn fill(&mut self, quantity: u64) -> Result<(), u64> {
         if quantity > self.remaining_quantity {
-            Err(LivreError::QuantityTooBig)
+            Err(self.remaining_quantity - quantity)
         } else {
             self.remaining_quantity -= quantity;
             Ok(())
         }
     }
 }
-
 #[derive(Debug)]
 pub struct ModifyOrder {
-    pub order_id: u64,
-    pub side: Side,
-    pub price: u64,
-    pub quantity: u64,
+    order_id: u64,
+    side: Side,
+    price: u64,
+    quantity: u64,
 }
 
 impl ModifyOrder {
-    fn to_order(self, order_type: OrderType) -> Order {
+    fn to_order(&self, order_type: OrderType) -> Order {
         Order::new(
             order_type,
             self.order_id,
@@ -138,7 +135,7 @@ impl Trade {
 }
 
 type TradeLog = Vec<Trade>;
-pub struct LevelIdentifier {
+struct LevelIdentifier {
     price: u64,
     side: Side,
 }
@@ -163,9 +160,9 @@ impl MatchInfo {
     }
 }
 pub struct Orderbook {
-    pub bids: BTreeMap<u64, VecDeque<Order>>,
-    pub asks: BTreeMap<u64, VecDeque<Order>>,
-    pub orders: HashMap<u64, LevelIdentifier>,
+    bids: BTreeMap<u64, VecDeque<Order>>,
+    asks: BTreeMap<u64, VecDeque<Order>>,
+    orders: HashMap<u64, LevelIdentifier>,
 }
 
 impl Orderbook {
@@ -178,35 +175,23 @@ impl Orderbook {
     }
 
     pub fn add_order(&mut self, mut order: Order) -> Result<MatchInfo, LivreError> {
-        match order {
-            Order {
-                side,
-                price,
-                order_type: OrderType::FillAndKill,
-                ..
-            } => {
-                if !self.can_match(side, price) {
+        match order.order_type {
+            OrderType::FillAndKill => {
+                if !self.can_match(order.side, order.price) {
                     return Err(LivreError::UnfillableOrder);
                 }
             }
-
-            Order {
-                side,
-                price,
-                initial_quantity,
-                order_type: OrderType::FillOrKill,
-                ..
-            } => {
-                if !self.can_fully_fill(price, initial_quantity, side) {
+            OrderType::FillOrKill => {
+                if !self.can_fully_fill(order.price, order.initial_quantity, order.side) {
                     return Err(LivreError::UnfillableOrder);
                 }
             }
-
-            Order { order_id, .. } if self.orders.contains_key(&order_id) => {
-                return Err(LivreError::DuplicateOrderId)
+            _ => {
+                if self.orders.contains_key(&order.order_id) {
+                    return Err(LivreError::DuplicateOrderId);
+                }
             }
-            _ => {}
-        };
+        }
 
         let trade_log = self.match_order(&mut order);
         let order_state = order.order_state();
@@ -322,18 +307,18 @@ impl Orderbook {
         }
     }
 
-    pub fn can_match(&self, side: Side, price: u64) -> bool {
+    fn can_match(&self, side: Side, price: u64) -> bool {
         match side {
             Side::Ask => {
-                if let Some((best_price, _)) = self.bids.last_key_value() {
-                    *best_price >= price
+                if let Some((&best_price, _)) = self.bids.last_key_value() {
+                    best_price >= price
                 } else {
                     false
                 }
             }
             Side::Bid => {
-                if let Some((best_price, _)) = self.asks.first_key_value() {
-                    *best_price <= price
+                if let Some((&best_price, _)) = self.asks.first_key_value() {
+                    best_price <= price
                 } else {
                     false
                 }
@@ -341,18 +326,18 @@ impl Orderbook {
         }
     }
 
-    pub fn can_fully_fill(&self, price: u64, mut quantity: u64, side: Side) -> bool {
+    fn can_fully_fill(&self, price: u64, mut quantity: u64, side: Side) -> bool {
         if !self.can_match(side, price) {
             return false;
         }
 
-        let mut level_iter: Box<dyn Iterator<Item = _>> = match side {
+        let level_iter: Box<dyn Iterator<Item = _>> = match side {
             Side::Ask => Box::new(self.bids.iter()),
             Side::Bid => Box::new(self.asks.iter().rev()),
         };
-        while let Some((level_price, queue)) = level_iter.next() {
-            if (matches!(side, Side::Ask) && *level_price < price)
-                || (matches!(side, Side::Bid) && *level_price > price)
+        for (&level_price, queue) in level_iter {
+            if (side == Side::Ask && level_price < price)
+                || (side == Side::Bid && level_price > price)
             {
                 return false;
             }
@@ -363,5 +348,11 @@ impl Orderbook {
             quantity -= level_quantity;
         }
         false
+    }
+}
+
+impl Default for Orderbook {
+    fn default() -> Self {
+        Self::new()
     }
 }
